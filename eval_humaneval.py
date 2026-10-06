@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 
-from specdec import (DEVICE, DRAFT_NAME, TARGET_NAME, autoregressive_generate, load_models,
+from specdec import (DEFAULT_PAIR, DEVICE, MODEL_PAIRS, autoregressive_generate, load_models,
                      speculative_generate, sync)
 
 # Стандартные стоп-последовательности HumanEval (как в Codex): функция закончилась
@@ -20,8 +20,9 @@ MODES = ["ars", "sps"]
 
 def parse_args():
     parser = argparse.ArgumentParser(description="ArS vs SpS на HumanEval")
-    parser.add_argument("--target", default=TARGET_NAME)
-    parser.add_argument("--draft", default=DRAFT_NAME)
+    parser.add_argument("--pair", choices=MODEL_PAIRS, default=DEFAULT_PAIR, help="пара (таргет, драфт)")
+    parser.add_argument("--target", default=None, help="переопределяет таргет из --pair")
+    parser.add_argument("--draft", default=None, help="переопределяет драфт из --pair")
     parser.add_argument("--dataset", default="openai/openai_humaneval",
                         help="имя на HF Hub, локальная папка или файл .jsonl/.jsonl.gz")
     parser.add_argument("--limit", type=int, default=None, help="взять только первые N задач")
@@ -30,7 +31,8 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--max-new-tokens", type=int, default=512)
-    parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
+    # float32 — для проверок корректности (greedy-совпадение ArS/SpS), большие таргеты в нём не влезут
+    parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=10.0, help="секунд на прогон тестов")
     parser.add_argument("--out-dir", default="results")
@@ -122,9 +124,12 @@ def summarize(records: list[dict]) -> dict:
 
     sps = [r["stats"] for r in records if r["mode"] == "sps"]
     accepted = sum(s["accepted"] for s in sps)
+    rejected = sum(s["rejected"] for s in sps)
     drafted = sum(s["drafted"] for s in sps)
     cycles = sum(s["cycles"] for s in sps)
     summary["sps"]["acceptance_rate"] = accepted / drafted
+    # α для формулы ускорения: доля принятых среди проверенных (после первого отказа черновики не проверяются)
+    summary["sps"]["alpha"] = accepted / max(accepted + rejected, 1)
     summary["sps"]["tokens_per_cycle"] = summary["sps"]["tokens"] / cycles
     summary["speedup"] = summary["ars"]["ms_per_token"] / summary["sps"]["ms_per_token"]
 
@@ -137,15 +142,16 @@ def summarize(records: list[dict]) -> dict:
 
 
 def print_summary(summary: dict, args):
-    print(f"\n=== HumanEval: K={args.K}, temperature={args.temperature}, top_p={args.top_p} ===")
+    print(f"\n=== HumanEval: {args.target} + {args.draft}, {args.dtype}, K={args.K}, "
+          f"temperature={args.temperature}, top_p={args.top_p} ===")
     print(f"{'Метод':<6} {'pass@1':>8} {'ms/token':>10} {'speedup':>8}")
     print(f"{'ArS':<6} {summary['ars']['pass@1']:>8.3f} {summary['ars']['ms_per_token']:>10.1f} {1.0:>7.2f}x")
     print(f"{'SpS':<6} {summary['sps']['pass@1']:>8.3f} {summary['sps']['ms_per_token']:>10.1f} "
           f"{summary['speedup']:>7.2f}x")
-    print(f"Acceptance rate: {summary['sps']['acceptance_rate']:.3f}, "
+    print(f"Acceptance rate: {summary['sps']['acceptance_rate']:.3f}, α: {summary['sps']['alpha']:.3f}, "
           f"токенов за цикл: {summary['sps']['tokens_per_cycle']:.2f}")
     print(f"Одинаковых ответов ArS/SpS: {summary['identical_completions']:.1%}"
-          + (" (при temperature=0 должно быть ~100%)" if args.temperature == 0 else ""))
+          + (" (при temperature=0 в float32 должно быть ~100%)" if args.temperature == 0 else ""))
 
 
 def main():
@@ -160,6 +166,8 @@ def main():
 
     torch.manual_seed(args.seed)
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
+    pair_target, pair_draft = MODEL_PAIRS[args.pair]
+    args.target, args.draft = args.target or pair_target, args.draft or pair_draft
     tokenizer, target, draft = load_models(args.target, args.draft, dtype)
     stop_fn = make_stop_fn(tokenizer)
 
@@ -170,7 +178,7 @@ def main():
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    run_name = f"humaneval_K{args.K}_T{args.temperature}_{time.strftime('%Y%m%d-%H%M%S')}"
+    run_name = f"humaneval_{args.pair}_K{args.K}_T{args.temperature}_{time.strftime('%Y%m%d-%H%M%S')}"
     records_path = out_dir / f"{run_name}.jsonl"
 
     records = []

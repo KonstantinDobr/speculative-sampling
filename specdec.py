@@ -1,33 +1,75 @@
+import os
 import time
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-TARGET_NAME = "HuggingFaceTB/SmolLM2-1.7B"
-DRAFT_NAME = "HuggingFaceTB/SmolLM2-135M"
+# Пары (таргет, драфт), только base-модели. Какую брать — решаем по замеру скоростей draft/target
+MODEL_PAIRS = {
+    "smollm2-135m-1.7b": ("HuggingFaceTB/SmolLM2-1.7B", "HuggingFaceTB/SmolLM2-135M"),
+    "smollm2-360m-1.7b": ("HuggingFaceTB/SmolLM2-1.7B", "HuggingFaceTB/SmolLM2-360M"),
+    "qwen2.5-0.5b-1.5b": ("Qwen/Qwen2.5-1.5B", "Qwen/Qwen2.5-0.5B"),
+    "qwen2.5-0.5b-3b": ("Qwen/Qwen2.5-3B", "Qwen/Qwen2.5-0.5B"),
+    "qwen2.5-0.5b-7b": ("Qwen/Qwen2.5-7B", "Qwen/Qwen2.5-0.5B"),
+    "qwen2.5-coder-0.5b-7b": ("Qwen/Qwen2.5-Coder-7B", "Qwen/Qwen2.5-Coder-0.5B"),
+}
+DEFAULT_PAIR = "smollm2-135m-1.7b"
+TARGET_NAME, DRAFT_NAME = MODEL_PAIRS[DEFAULT_PAIR]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def resolve_model(name: str) -> str:
+    # На кластере интернета нет: если задан MODELS_DIR, модель берётся оттуда по последней части имени
+    models_dir = os.environ.get("MODELS_DIR")
+    if models_dir is None or os.path.exists(name):
+        return name
+
+    path = os.path.join(models_dir, name.split("/")[-1])
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"Нет модели {path}: скачайте {name} в {models_dir}")
+    return path
+
+
+def load_model(name: str, dtype: torch.dtype, n_vocab: int, device: str):
+    model = AutoModelForCausalLM.from_pretrained(name, dtype=dtype)
+
+    # У Qwen выходной слой дополнен до «круглого» размера, и у моделей разного размера по-разному.
+    # Обрезаем до словаря токенизатора: распределения target и draft должны быть над одними токенами
+    assert model.config.vocab_size >= n_vocab, (
+        f"{name}: выход {model.config.vocab_size} меньше словаря токенизатора {n_vocab}"
+    )
+    if model.config.vocab_size > n_vocab:
+        model.resize_token_embeddings(n_vocab)
+
+    return model.to(device).eval()
+
+
+def describe(model) -> str:
+    config = model.config
+    return (f"{model.num_parameters() / 1e6:.0f}M параметров, {config.num_hidden_layers} слоёв, "
+            f"hidden {config.hidden_size}")
 
 
 def load_models(target_name: str = TARGET_NAME, draft_name: str = DRAFT_NAME,
                 dtype: torch.dtype = torch.float32, device: str = DEVICE):
+    target_name, draft_name = resolve_model(target_name), resolve_model(draft_name)
     tokenizer = AutoTokenizer.from_pretrained(target_name)
     draft_tokenizer = AutoTokenizer.from_pretrained(draft_name)
 
     assert tokenizer.get_vocab() == draft_tokenizer.get_vocab(), "У моделей разные токенизаторы!"
-
-    target = AutoModelForCausalLM.from_pretrained(target_name, dtype=dtype).to(device)
-    draft = AutoModelForCausalLM.from_pretrained(draft_name, dtype=dtype).to(device)
-
-    target.eval()
-    draft.eval()
-
-    assert target.config.vocab_size == draft.config.vocab_size, (
-        f"Разный размер выхода: {target.config.vocab_size} vs {draft.config.vocab_size}"
+    # У instruct-версий другой EOS (например, <|im_end|> у Qwen): так ловим смешанную пару base + instruct
+    assert (tokenizer.eos_token_id, tokenizer.bos_token_id) == \
+           (draft_tokenizer.eos_token_id, draft_tokenizer.bos_token_id), (
+        "Разные EOS/BOS: возможно, одна из моделей instruct-версия"
     )
 
-    print(f"Загружено на {device}. Словарь: {target.config.vocab_size} токенов, "
-          f"таргет: {target.num_parameters() / 1e6:.0f}M параметров, "
-          f"драфт: {draft.num_parameters() / 1e6:.0f}M параметров")
+    n_vocab = len(tokenizer)
+    target = load_model(target_name, dtype, n_vocab, device)
+    draft = load_model(draft_name, dtype, n_vocab, device)
+
+    print(f"Загружено на {device} в {dtype}. Словарь: {n_vocab} токенов\n"
+          f"  таргет {target_name}: {describe(target)}\n"
+          f"  драфт  {draft_name}: {describe(draft)}")
 
     return tokenizer, target, draft
 
@@ -100,6 +142,7 @@ def speculative_generate(target, draft, input_ids: torch.Tensor, max_new_tokens:
     start_seq_len = input_ids.shape[1]
     stats = {'cycles': 0,
              'accepted': 0,
+             'rejected': 0,
              'drafted': 0}
 
     while input_ids.shape[1] - start_seq_len < max_new_tokens:
@@ -133,6 +176,7 @@ def speculative_generate(target, draft, input_ids: torch.Tensor, max_new_tokens:
                 new_tokens.append(guess_num)
                 stats['accepted'] += 1
             else:
+                stats['rejected'] += 1
                 new_tokens.append(sample(residual_distribution(q_t, p_t)))
                 break
         else:
