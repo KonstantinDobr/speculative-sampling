@@ -15,11 +15,13 @@
 cd "$SLURM_SUBMIT_DIR"
 
 # Общее окружение и модели команды (см. /data/shared/specdec_team/README.md), в интернет не ходим.
-# Модели лежат в $MODELS_DIR/<имя без организации>, например /data/shared/hf/Qwen2.5-7B
+# Модели лежат в <папка из MODELS_DIR>/<имя без организации>, например /data/teams/<команда>/models/Qwen2.5-7B
 ENV_DIR=/data/shared/specdec_team/.venv
 export HF_HOME=/data/shared/hf
 export HF_HUB_OFFLINE=1
-export MODELS_DIR=/data/shared/hf
+# Модели: сначала папка команды (download_models.sh), потом общая read-only
+TEAM_DIR=${TEAM_DIR:-/data/teams/specdec_team}
+export MODELS_DIR="$TEAM_DIR/models:/data/shared/hf"
 export PYTHONNOUSERSITE=1
 export LD_LIBRARY_PATH="$ENV_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 

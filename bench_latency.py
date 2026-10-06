@@ -10,7 +10,7 @@ import transformers
 from transformers import AutoTokenizer
 
 from eval_humaneval import get_prompt, load_humaneval, make_stop_fn
-from specdec import (DEVICE, MODEL_PAIRS, describe, load_model, load_models, resolve_model,
+from specdec import (DEVICE, MODEL_PAIRS, describe, load_model, load_models, resolve_model, rollback,
                      speculative_generate, sync)
 
 ALPHAS = [0.5, 0.6, 0.7, 0.8, 0.9]
@@ -80,7 +80,7 @@ def measure_model(name: str, dtype: torch.dtype, args) -> dict:
         decode = {}
         for n in range(1, args.max_K + 2):
             decode[n] = time_call(lambda n=n: model(ids[:, L:L + n], past_key_values=cache, use_cache=True),
-                                  args.repeats, args.warmup, reset=lambda: cache.crop(L))
+                                  args.repeats, args.warmup, reset=lambda: rollback(cache, L))
 
         # Для справки: один токен без KV-кэша, как сейчас работает specdec.py
         no_cache = time_call(lambda: model(ids[:, :L + 1]), args.repeats, args.warmup)

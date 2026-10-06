@@ -2,7 +2,7 @@ import os
 import time
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 # Пары (таргет, драфт), только base-модели. Какую брать — решаем по замеру скоростей draft/target
 MODEL_PAIRS = {
@@ -19,15 +19,18 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def resolve_model(name: str) -> str:
-    # На кластере интернета нет: если задан MODELS_DIR, модель берётся оттуда по последней части имени
-    models_dir = os.environ.get("MODELS_DIR")
-    if models_dir is None or os.path.exists(name):
+    # На кластере интернета нет: если задан MODELS_DIR (несколько папок через ":", как PATH),
+    # модель берётся из первой папки, где есть подпапка с последней частью имени
+    models_dirs = os.environ.get("MODELS_DIR")
+    if not models_dirs or os.path.exists(name):
         return name
 
-    path = os.path.join(models_dir, name.split("/")[-1])
-    if not os.path.isdir(path):
-        raise FileNotFoundError(f"Нет модели {path}: скачайте {name} в {models_dir}")
-    return path
+    for models_dir in models_dirs.split(os.pathsep):
+        path = os.path.join(models_dir, name.split("/")[-1])
+        if os.path.isdir(path):
+            return path
+    raise FileNotFoundError(f"Нет модели {name} ни в одной из папок MODELS_DIR={models_dirs}: "
+                            f"скачайте её через download_models.sh")
 
 
 def load_model(name: str, dtype: torch.dtype, n_vocab: int, device: str):
@@ -103,9 +106,21 @@ def to_probs(logits: torch.Tensor, temperature: float, top_p: float = 1.0) -> to
 
 
 @torch.no_grad()
-def get_probs(model, input_ids: torch.Tensor, temperature: float, top_p: float = 1.0) -> torch.Tensor:
-    token_tensor = model(input_ids).logits[0]
+def get_probs(model, input_ids: torch.Tensor, temperature: float, top_p: float = 1.0,
+              cache: DynamicCache | None = None) -> torch.Tensor:
+    # С кэшем подаём только токены, которых в нём ещё нет, и распределения получаем только для них
+    if cache is not None:
+        input_ids = input_ids[:, cache.get_seq_length():]
+    token_tensor = model(input_ids, past_key_values=cache, use_cache=cache is not None).logits[0]
     return to_probs(token_tensor, temperature, top_p)
+
+
+def rollback(cache: DynamicCache, length: int):
+    # crop(-n) убирает n последних токенов и работает во всех версиях transformers
+    # (crop с положительной длиной в новых устарел). crop(0) обнулил бы кэш, поэтому только при n > 0
+    extra = cache.get_seq_length() - length
+    if extra > 0:
+        cache.crop(-extra)
 
 
 def sample(probs: torch.Tensor) -> int:
@@ -114,11 +129,13 @@ def sample(probs: torch.Tensor) -> int:
 
 def autoregressive_generate(model, input_ids: torch.Tensor, max_new_tokens: int,
                             temperature: float, top_p: float = 1.0,
-                            eos_token_id: int | None = None, stop_fn=None) -> torch.Tensor:
+                            eos_token_id: int | None = None, stop_fn=None,
+                            use_cache: bool = True) -> torch.Tensor:
     start_seq_len = input_ids.shape[1]
+    cache = DynamicCache() if use_cache else None
 
     for _ in range(max_new_tokens):
-        probs = get_probs(model, input_ids, temperature, top_p)[-1]
+        probs = get_probs(model, input_ids, temperature, top_p, cache)[-1]
         new_token = sample(probs)
 
         input_ids = torch.cat([input_ids, torch.tensor([[new_token]], device=input_ids.device)], dim=1)
@@ -131,13 +148,33 @@ def autoregressive_generate(model, input_ids: torch.Tensor, max_new_tokens: int,
 
 def residual_distribution(q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
     diff = torch.clamp(q - p, min=0)
-    diff = diff / diff.sum()
-    return diff
+    total = diff.sum()
+    # При q ≈ p остаток численно нулевой (отказ тогда почти невозможен): сэмплируем из q, а не из NaN
+    if total <= 0:
+        return q
+    return diff / total
+
+
+def verify(guesses: list[int], draft_probs: list[torch.Tensor],
+           target_probs: torch.Tensor) -> tuple[list[int], int]:
+    # Rejection sampling из Chen et al.: guesses[i] сэмплирован из draft_probs[i], target_probs — K+1
+    # распределений таргета (для каждого черновика и ещё одно для бонусного токена).
+    # Возвращает новые токены (принятые черновики + исправленный или бонусный токен) и число принятых
+    for idx, guess_num in enumerate(guesses):
+        q_t = target_probs[idx]
+        p_t = draft_probs[idx]
+        a = min(1.0, (q_t[guess_num] / p_t[guess_num]).item())
+        r = torch.rand(1).item()
+
+        if r >= a:
+            return guesses[:idx] + [sample(residual_distribution(q_t, p_t))], idx
+
+    return guesses + [sample(target_probs[len(guesses)])], len(guesses)
 
 
 def speculative_generate(target, draft, input_ids: torch.Tensor, max_new_tokens: int,
                          K: int, temperature: float, top_p: float = 1.0,
-                         eos_token_id: int | None = None, stop_fn=None):
+                         eos_token_id: int | None = None, stop_fn=None, use_cache: bool = True):
     device = input_ids.device
     start_seq_len = input_ids.shape[1]
     stats = {'cycles': 0,
@@ -145,16 +182,21 @@ def speculative_generate(target, draft, input_ids: torch.Tensor, max_new_tokens:
              'rejected': 0,
              'drafted': 0}
 
+    # Инвариант между циклами: в кэше каждой модели лежат принятые токены, кроме последнего (или меньше).
+    # Всё, чего в кэше нет, get_probs досчитает сам
+    target_cache = DynamicCache() if use_cache else None
+    draft_cache = DynamicCache() if use_cache else None
+
     while input_ids.shape[1] - start_seq_len < max_new_tokens:
 
         stats['cycles'] += 1
 
-        input_draft = input_ids.clone()
+        input_draft = input_ids
         guesses = []
         draft_probs = []
         for _ in range(K):
             stats['drafted'] += 1
-            p_t = get_probs(draft, input_draft, temperature, top_p)[-1]
+            p_t = get_probs(draft, input_draft, temperature, top_p, draft_cache)[-1]
 
             draft_guess = sample(p_t)
             guesses.append(draft_guess)
@@ -162,31 +204,23 @@ def speculative_generate(target, draft, input_ids: torch.Tensor, max_new_tokens:
 
             input_draft = torch.cat([input_draft, torch.tensor([[draft_guess]], device=device)], dim=1)
 
-        target_probs = get_probs(target, input_draft, temperature, top_p)
+        target_probs = get_probs(target, input_draft, temperature, top_p, target_cache)[-(K + 1):]
 
-        new_tokens = []
-        for idx in range(K):
-            guess_num = guesses[idx]
-            q_t = target_probs[-(K + 1 - idx)]
-            p_t = draft_probs[idx]
-            a = min(1.0, (q_t[guess_num] / p_t[guess_num]).item())
-            r = torch.rand(1).item()
-
-            if r < a:
-                new_tokens.append(guess_num)
-                stats['accepted'] += 1
-            else:
-                stats['rejected'] += 1
-                new_tokens.append(sample(residual_distribution(q_t, p_t)))
-                break
-        else:
-            new_tokens.append(sample(target_probs[-1]))
+        new_tokens, n_accepted = verify(guesses, draft_probs, target_probs)
+        stats['accepted'] += n_accepted
+        stats['rejected'] += int(n_accepted < K)
 
         # Всё, что после EOS, выбрасываем
         if eos_token_id in new_tokens:
             new_tokens = new_tokens[:new_tokens.index(eos_token_id) + 1]
 
         input_ids = torch.cat([input_ids, torch.tensor([new_tokens], device=device)], dim=1)
+
+        # Откат кэшей: отбрасываем отклонённые черновики и восстанавливаем инвариант. Если приняты все K,
+        # драфт ещё не видел последний черновик — в следующем цикле он получит его вместе с бонусным токеном
+        if use_cache:
+            rollback(target_cache, input_ids.shape[1] - 1)
+            rollback(draft_cache, input_ids.shape[1] - 1)
 
         if eos_token_id in new_tokens or (stop_fn is not None and stop_fn(input_ids[0, start_seq_len:])):
             break
@@ -223,7 +257,8 @@ def main():
     print(f"ArS: {ar_time / max_new_tokens * 1000:.1f} ms/token")
     print(f"SpS: {sps_time / max_new_tokens * 1000:.1f} ms/token")
     print(f"Speedup: {ar_time / sps_time:.2f}x")
-    print(f"Acceptance rate: {stats['accepted'] / stats['drafted']:.2f}")
+    # При K=0 черновиков нет: делим на max(..., 1)
+    print(f"Acceptance rate: {stats['accepted'] / max(stats['drafted'], 1):.2f}")
 
     if temperature == 0.0:
         n = input_ids.shape[1] + max_new_tokens

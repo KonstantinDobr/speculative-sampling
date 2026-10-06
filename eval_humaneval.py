@@ -127,7 +127,7 @@ def summarize(records: list[dict]) -> dict:
     rejected = sum(s["rejected"] for s in sps)
     drafted = sum(s["drafted"] for s in sps)
     cycles = sum(s["cycles"] for s in sps)
-    summary["sps"]["acceptance_rate"] = accepted / drafted
+    summary["sps"]["acceptance_rate"] = accepted / max(drafted, 1)  # при K=0 черновиков нет
     # α для формулы ускорения: доля принятых среди проверенных (после первого отказа черновики не проверяются)
     summary["sps"]["alpha"] = accepted / max(accepted + rejected, 1)
     summary["sps"]["tokens_per_cycle"] = summary["sps"]["tokens"] / cycles
