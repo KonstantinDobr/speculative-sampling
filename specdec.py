@@ -106,13 +106,19 @@ def to_probs(logits: torch.Tensor, temperature: float, top_p: float = 1.0) -> to
 
 
 @torch.no_grad()
-def get_probs(model, input_ids: torch.Tensor, temperature: float, top_p: float = 1.0,
-              cache: DynamicCache | None = None) -> torch.Tensor:
-    # С кэшем подаём только токены, которых в нём ещё нет, и распределения получаем только для них
+def get_logits(model, input_ids: torch.Tensor, cache: DynamicCache | None = None,
+               n_last: int | None = None) -> torch.Tensor:
+    # С кэшем подаём только токены, которых в нём ещё нет. n_last — для скольких последних позиций
+    # нужны логиты: lm_head по всей длине при словаре Qwen (~150 тыс.) заметно дорог
     if cache is not None:
         input_ids = input_ids[:, cache.get_seq_length():]
-    token_tensor = model(input_ids, past_key_values=cache, use_cache=cache is not None).logits[0]
-    return to_probs(token_tensor, temperature, top_p)
+    kwargs = {} if n_last is None else {"logits_to_keep": n_last}
+    return model(input_ids, past_key_values=cache, use_cache=cache is not None, **kwargs).logits[0]
+
+
+def get_probs(model, input_ids: torch.Tensor, temperature: float, top_p: float = 1.0,
+              cache: DynamicCache | None = None, n_last: int | None = None) -> torch.Tensor:
+    return to_probs(get_logits(model, input_ids, cache, n_last), temperature, top_p)
 
 
 def rollback(cache: DynamicCache, length: int):
@@ -123,106 +129,148 @@ def rollback(cache: DynamicCache, length: int):
         cache.crop(-extra)
 
 
-def sample(probs: torch.Tensor) -> int:
-    return torch.multinomial(probs, num_samples=1).item()
+def sample(probs: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
+    # Токен остаётся тензором на устройстве: .item() здесь означал бы синхронизацию CPU с GPU
+    return torch.multinomial(probs, num_samples=1, generator=generator)
+
+
+def make_generator(seed: int, device: str = DEVICE) -> torch.Generator:
+    # Один генератор на всю генерацию: и сэмплирование токенов, и равномерные числа для проверки
+    return torch.Generator(device=device).manual_seed(seed)
+
+
+def count_leading_false(mask: torch.Tensor) -> int:
+    # Индекс первого True (или длина маски, если True нет) за одну синхронизацию
+    return int((~mask).int().cumprod(dim=0).sum())
 
 
 def autoregressive_generate(model, input_ids: torch.Tensor, max_new_tokens: int,
                             temperature: float, top_p: float = 1.0,
                             eos_token_id: int | None = None, stop_fn=None,
-                            use_cache: bool = True) -> torch.Tensor:
+                            use_cache: bool = True, generator: torch.Generator | None = None) -> torch.Tensor:
     start_seq_len = input_ids.shape[1]
     cache = DynamicCache() if use_cache else None
 
     for _ in range(max_new_tokens):
-        probs = get_probs(model, input_ids, temperature, top_p, cache)[-1]
-        new_token = sample(probs)
+        logits = get_logits(model, input_ids, cache, n_last=1)[-1]
+        if temperature == 0:
+            new_token = logits.argmax(dim=-1, keepdim=True)
+        else:
+            new_token = sample(to_probs(logits, temperature, top_p), generator)
 
-        input_ids = torch.cat([input_ids, torch.tensor([[new_token]], device=input_ids.device)], dim=1)
+        input_ids = torch.cat([input_ids, new_token.view(1, 1)], dim=1)
 
-        if new_token == eos_token_id or (stop_fn is not None and stop_fn(input_ids[0, start_seq_len:])):
+        if ((eos_token_id is not None and new_token.item() == eos_token_id)
+                or (stop_fn is not None and stop_fn(input_ids[0, start_seq_len:]))):
             break
 
     return input_ids
 
 
-def residual_distribution(q: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
-    diff = torch.clamp(q - p, min=0)
+# Обозначения как в Chen et al.: p — таргет, q — драфт
+
+def residual_distribution(p_target: torch.Tensor, q_draft: torch.Tensor) -> torch.Tensor:
+    diff = torch.clamp(p_target - q_draft, min=0)
     total = diff.sum()
-    # При q ≈ p остаток численно нулевой (отказ тогда почти невозможен): сэмплируем из q, а не из NaN
-    if total <= 0:
-        return q
-    return diff / total
+    # При p ≈ q остаток численно нулевой (отказ тогда почти невозможен): сэмплируем из p, а не из NaN.
+    # torch.where вместо if — без синхронизации с GPU
+    return torch.where(total > 0, diff / total, p_target)
 
 
-def verify(guesses: list[int], draft_probs: list[torch.Tensor],
-           target_probs: torch.Tensor) -> tuple[list[int], int]:
-    # Rejection sampling из Chen et al.: guesses[i] сэмплирован из draft_probs[i], target_probs — K+1
-    # распределений таргета (для каждого черновика и ещё одно для бонусного токена).
-    # Возвращает новые токены (принятые черновики + исправленный или бонусный токен) и число принятых
-    for idx, guess_num in enumerate(guesses):
-        q_t = target_probs[idx]
-        p_t = draft_probs[idx]
-        a = min(1.0, (q_t[guess_num] / p_t[guess_num]).item())
-        r = torch.rand(1).item()
+def verify(guesses: torch.Tensor, q_draft: torch.Tensor | None, p_target: torch.Tensor,
+           generator: torch.Generator | None = None) -> tuple[torch.Tensor, int]:
+    # Rejection sampling: guesses[i] сэмплирован из q_draft[i], p_target — K+1 распределений таргета
+    # (для каждого черновика и ещё одно для бонусного токена). Черновик i принимается с вероятностью
+    # min(1, p(x)/q(x)). Возвращает новые токены (принятые черновики + исправленный или бонусный токен)
+    # и число принятых
+    K = guesses.shape[0]
+    if K == 0:
+        return sample(p_target[0], generator), 0
 
-        if r >= a:
-            return guesses[:idx] + [sample(residual_distribution(q_t, p_t))], idx
+    positions = torch.arange(K, device=guesses.device)
+    ratio = p_target[positions, guesses] / q_draft[positions, guesses]
+    r = torch.rand(K, device=guesses.device, generator=generator)
+    n_accepted = count_leading_false(r >= ratio)
 
-    return guesses + [sample(target_probs[len(guesses)])], len(guesses)
+    if n_accepted < K:
+        last = sample(residual_distribution(p_target[n_accepted], q_draft[n_accepted]), generator)
+    else:
+        last = sample(p_target[K], generator)
+    return torch.cat([guesses[:n_accepted], last]), n_accepted
+
+
+def verify_greedy(guesses: torch.Tensor, target_argmax: torch.Tensor) -> tuple[torch.Tensor, int]:
+    # При temperature=0 распределения one-hot: черновик принимается, если совпал с argmax таргета,
+    # а остаток и бонусный токен — это argmax таргета. То же, что verify, но без вероятностей
+    n_accepted = count_leading_false(guesses != target_argmax[:guesses.shape[0]])
+    return torch.cat([guesses[:n_accepted], target_argmax[n_accepted:n_accepted + 1]]), n_accepted
 
 
 def speculative_generate(target, draft, input_ids: torch.Tensor, max_new_tokens: int,
                          K: int, temperature: float, top_p: float = 1.0,
-                         eos_token_id: int | None = None, stop_fn=None, use_cache: bool = True):
+                         eos_token_id: int | None = None, stop_fn=None, use_cache: bool = True,
+                         generator: torch.Generator | None = None):
     device = input_ids.device
     start_seq_len = input_ids.shape[1]
+    greedy = temperature == 0
     stats = {'cycles': 0,
              'accepted': 0,
              'rejected': 0,
              'drafted': 0}
 
     # Инвариант между циклами: в кэше каждой модели лежат принятые токены, кроме последнего (или меньше).
-    # Всё, чего в кэше нет, get_probs досчитает сам
+    # Всё, чего в кэше нет, get_logits досчитает сам
     target_cache = DynamicCache() if use_cache else None
     draft_cache = DynamicCache() if use_cache else None
 
-    while input_ids.shape[1] - start_seq_len < max_new_tokens:
+    while (generated := input_ids.shape[1] - start_seq_len) < max_new_tokens:
 
         stats['cycles'] += 1
+        # Цикл даёт до K+1 токенов: в конце не черновим то, что всё равно отрежем по max_new_tokens
+        k = min(K, max_new_tokens - generated - 1)
+        stats['drafted'] += k
 
         input_draft = input_ids
         guesses = []
         draft_probs = []
-        for _ in range(K):
-            stats['drafted'] += 1
-            p_t = get_probs(draft, input_draft, temperature, top_p, draft_cache)[-1]
-
-            draft_guess = sample(p_t)
+        for _ in range(k):
+            logits = get_logits(draft, input_draft, draft_cache, n_last=1)[-1]
+            if greedy:
+                draft_guess = logits.argmax(dim=-1, keepdim=True)
+            else:
+                q_t = to_probs(logits, temperature, top_p)
+                draft_guess = sample(q_t, generator)
+                draft_probs.append(q_t)
             guesses.append(draft_guess)
-            draft_probs.append(p_t)
 
-            input_draft = torch.cat([input_draft, torch.tensor([[draft_guess]], device=device)], dim=1)
+            input_draft = torch.cat([input_draft, draft_guess.view(1, 1)], dim=1)
 
-        target_probs = get_probs(target, input_draft, temperature, top_p, target_cache)[-(K + 1):]
+        guesses = torch.cat(guesses) if guesses else torch.empty(0, dtype=torch.long, device=device)
+        target_logits = get_logits(target, input_draft, target_cache, n_last=k + 1)
 
-        new_tokens, n_accepted = verify(guesses, draft_probs, target_probs)
+        if greedy:
+            new_tokens, n_accepted = verify_greedy(guesses, target_logits.argmax(dim=-1))
+        else:
+            new_tokens, n_accepted = verify(guesses, torch.stack(draft_probs) if draft_probs else None,
+                                            to_probs(target_logits, temperature, top_p), generator)
         stats['accepted'] += n_accepted
-        stats['rejected'] += int(n_accepted < K)
+        stats['rejected'] += int(n_accepted < k)
 
         # Всё, что после EOS, выбрасываем
-        if eos_token_id in new_tokens:
-            new_tokens = new_tokens[:new_tokens.index(eos_token_id) + 1]
+        token_list = new_tokens.tolist()
+        hit_eos = eos_token_id in token_list
+        if hit_eos:
+            new_tokens = new_tokens[:token_list.index(eos_token_id) + 1]
 
-        input_ids = torch.cat([input_ids, torch.tensor([new_tokens], device=device)], dim=1)
+        input_ids = torch.cat([input_ids, new_tokens.view(1, -1)], dim=1)
 
-        # Откат кэшей: отбрасываем отклонённые черновики и восстанавливаем инвариант. Если приняты все K,
+        # Откат кэшей: отбрасываем отклонённые черновики и восстанавливаем инвариант. Если приняты все k,
         # драфт ещё не видел последний черновик — в следующем цикле он получит его вместе с бонусным токеном
         if use_cache:
             rollback(target_cache, input_ids.shape[1] - 1)
             rollback(draft_cache, input_ids.shape[1] - 1)
 
-        if eos_token_id in new_tokens or (stop_fn is not None and stop_fn(input_ids[0, start_seq_len:])):
+        if hit_eos or (stop_fn is not None and stop_fn(input_ids[0, start_seq_len:])):
             break
 
     return input_ids, stats

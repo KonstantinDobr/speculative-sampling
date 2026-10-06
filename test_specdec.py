@@ -8,7 +8,7 @@ import pytest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from specdec import (autoregressive_generate, get_probs, residual_distribution, sample,
+from specdec import (autoregressive_generate, get_probs, make_generator, residual_distribution, sample,
                      speculative_generate, verify)
 
 torch.set_num_threads(1)
@@ -29,31 +29,32 @@ def chi2_ok(counts: Counter, probs: dict, n: int) -> tuple[bool, float]:
 
 # ---------- rejection sampling на игрушечных распределениях, без моделей ----------
 
-Q = torch.tensor([0.4, 0.3, 0.2, 0.1])  # таргет
-P = torch.tensor([0.1, 0.2, 0.3, 0.4])  # драфт, β = Σ min(p, q) = 0.6
+# Обозначения как в Chen et al.: p — таргет, q — драфт
+P = torch.tensor([0.4, 0.3, 0.2, 0.1])  # таргет
+Q = torch.tensor([0.1, 0.2, 0.3, 0.4])  # драфт, β = Σ min(p, q) = 0.6
 
 
-def iid_speculative(p: torch.Tensor, q: torch.Tensor, K: int, length: int) -> tuple:
-    # Распределения не зависят от контекста: тогда SpS обязан выдавать i.i.d. токены из q
+def iid_speculative(p_target: torch.Tensor, q_draft: torch.Tensor, K: int, length: int) -> tuple:
+    # Распределения не зависят от контекста: тогда SpS обязан выдавать i.i.d. токены из p
     tokens = []
     while len(tokens) < length:
-        guesses = [sample(p) for _ in range(K)]
-        new_tokens, _ = verify(guesses, [p] * K, q.expand(K + 1, -1))
-        tokens += new_tokens
+        guesses = torch.cat([sample(q_draft) for _ in range(K)])
+        new_tokens, _ = verify(guesses, q_draft.expand(K, -1), p_target.expand(K + 1, -1))
+        tokens += new_tokens.tolist()
     return tuple(tokens[:length])
 
 
 def test_residual_distribution():
-    r = residual_distribution(Q, P)
+    r = residual_distribution(P, Q)
     assert torch.all(r >= 0) and torch.isclose(r.sum(), torch.tensor(1.0))
-    # max(0, q - p) = (0.3, 0.1, 0, 0), нормируем на 0.4
+    # max(0, p - q) = (0.3, 0.1, 0, 0), нормируем на 0.4
     assert torch.allclose(r, torch.tensor([0.75, 0.25, 0.0, 0.0]))
 
 
 def test_residual_distribution_equal_falls_back_to_target():
-    r = residual_distribution(Q, Q.clone())
+    r = residual_distribution(P, P.clone())
     assert not torch.isnan(r).any()
-    assert torch.equal(r, Q)
+    assert torch.equal(r, P)
 
 
 @pytest.mark.parametrize("K", [1, 3])
@@ -66,19 +67,19 @@ def test_verify_matches_target_distribution(K):
     for i in range(4):
         for j in range(4):
             for k in range(4):
-                joint[(i, j, k)] = (Q[i] * Q[j] * Q[k]).item()
+                joint[(i, j, k)] = (P[i] * P[j] * P[k]).item()
     ok, stat = chi2_ok(counts, joint, n)
-    assert ok, f"χ² = {stat:.1f}: совместное распределение 3 токенов не совпадает с q"
+    assert ok, f"χ² = {stat:.1f}: совместное распределение 3 токенов не совпадает с p"
 
     # Контроль мощности теста: сэмплы драфта (как если бы всё принималось) тест обязан отвергнуть
-    draft_counts = Counter(tuple(sample(P) for _ in range(length)) for _ in range(n))
+    draft_counts = Counter(tuple(sample(Q).item() for _ in range(length)) for _ in range(n))
     assert not chi2_ok(draft_counts, joint, n)[0]
 
 
 def test_acceptance_rate_equals_beta():
     torch.manual_seed(1)
     n = 20000
-    accepted = sum(verify([sample(P)], [P], Q.expand(2, -1))[1] for _ in range(n))
+    accepted = sum(verify(sample(Q), Q[None], P.expand(2, -1))[1] for _ in range(n))
     beta = torch.minimum(P, Q).sum().item()
     sigma = math.sqrt(beta * (1 - beta) / n)
     assert abs(accepted / n - beta) < 5 * sigma, f"доля принятия {accepted / n:.3f}, β = {beta:.3f}"
@@ -134,13 +135,12 @@ def test_greedy_matches_ars(models, draft_name, use_cache, prompt):
     input_ids = torch.tensor([prompt])
     max_new_tokens = 40
     expected = autoregressive_generate(target, input_ids, max_new_tokens, 0.0)
-    n = input_ids.shape[1] + max_new_tokens
 
     for K in range(8):
         output, stats = speculative_generate(target, drafts[draft_name], input_ids, max_new_tokens, K, 0.0,
                                              use_cache=use_cache)
-        assert torch.equal(output[0, :n], expected[0, :n]), f"K={K}"
-        assert stats["drafted"] == K * stats["cycles"]
+        assert torch.equal(output, expected), f"K={K}"  # в том числе ровно max_new_tokens токенов
+        assert stats["drafted"] <= K * stats["cycles"]
         if K == 0:
             assert stats["accepted"] == stats["rejected"] == 0
 
@@ -181,9 +181,31 @@ def test_sampling_matches_target(temperature, top_p, K):
 
     torch.manual_seed(5)
     n = 2000
+    # max_new_tokens = K + 1, чтобы в первом цикле было ровно K черновиков (последний цикл их урезает)
     counts = Counter(
-        tuple(speculative_generate(target, draft, input_ids, 2, K, temperature, top_p)[0][0, 3:5].tolist())
+        tuple(speculative_generate(target, draft, input_ids, K + 1, K, temperature, top_p)[0][0, 3:5].tolist())
         for _ in range(n)
     )
     ok, stat = chi2_ok(counts, exact, n)
     assert ok, f"χ² = {stat:.1f}"
+
+
+def test_generator_reproducible(models):
+    target, drafts = models
+    input_ids = torch.tensor([PROMPTS[0]])
+    for run in (
+        lambda g: autoregressive_generate(target, input_ids, 30, 1.0, generator=g),
+        lambda g: speculative_generate(target, drafts["close"], input_ids, 30, 4, 1.0, generator=g)[0],
+    ):
+        first, second = run(make_generator(7, "cpu")), run(make_generator(7, "cpu"))
+        assert torch.equal(first, second)
+        assert not torch.equal(first, run(make_generator(8, "cpu")))
+
+
+@pytest.mark.parametrize("K", [1, 3, 7])
+def test_sps_never_exceeds_max_new_tokens(models, K):
+    target, drafts = models
+    input_ids = torch.tensor([PROMPTS[0]])
+    for max_new_tokens in (1, 2, 5, 13):
+        output, _ = speculative_generate(target, drafts["same"], input_ids, max_new_tokens, K, 1.0)
+        assert output.shape[1] == input_ids.shape[1] + max_new_tokens

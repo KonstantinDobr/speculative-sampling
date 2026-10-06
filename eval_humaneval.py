@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 
 from specdec import (DEFAULT_PAIR, DEVICE, MODEL_PAIRS, autoregressive_generate, load_models,
-                     speculative_generate, sync)
+                     make_generator, speculative_generate, sync)
 
 # Стандартные стоп-последовательности HumanEval (как в Codex): функция закончилась
 STOP_SEQUENCES = ["\nclass", "\ndef", "\n#", "\nif", "\nprint"]
@@ -87,24 +87,26 @@ def run_tests(problem: dict, completion: str, timeout: float) -> bool:
     return result.returncode == 0
 
 
-def generate(mode: str, target, draft, tokenizer, input_ids: torch.Tensor, args, stop_fn) -> dict:
+def generate(mode: str, target, draft, tokenizer, input_ids: torch.Tensor, args, stop_fn, seed: int) -> dict:
+    # Своё зерно на каждую пару (задача, сэмпл), одинаковое для ArS и SpS: оба стартуют из одного состояния
+    generator = make_generator(seed)
     sync()
     start = time.perf_counter()
 
     if mode == "ars":
         output = autoregressive_generate(target, input_ids, args.max_new_tokens, args.temperature,
-                                         args.top_p, tokenizer.eos_token_id, stop_fn)
+                                         args.top_p, tokenizer.eos_token_id, stop_fn, generator=generator)
         stats = None
     else:
         output, stats = speculative_generate(target, draft, input_ids, args.max_new_tokens, args.K,
-                                             args.temperature, args.top_p, tokenizer.eos_token_id, stop_fn)
+                                             args.temperature, args.top_p, tokenizer.eos_token_id, stop_fn,
+                                             generator=generator)
 
     sync()
     elapsed = time.perf_counter() - start
 
     generated = output[0, input_ids.shape[1]:]
-    # SpS может уйти за max_new_tokens максимум на K токенов: в текст их не берём, в тайминг — берём
-    text = tokenizer.decode(generated[:args.max_new_tokens], skip_special_tokens=True)
+    text = tokenizer.decode(generated, skip_special_tokens=True)
 
     return {"completion": truncate(text), "n_tokens": len(generated), "time": elapsed, "stats": stats}
 
@@ -188,7 +190,8 @@ def main():
 
             for sample_idx in range(args.n_samples):
                 for mode in MODES:
-                    result = generate(mode, target, draft, tokenizer, input_ids, args, stop_fn)
+                    seed = args.seed * 1_000_000 + i * 1000 + sample_idx
+                    result = generate(mode, target, draft, tokenizer, input_ids, args, stop_fn, seed)
                     result["passed"] = run_tests(problem, result["completion"], args.timeout)
                     record = {"task_id": problem["task_id"], "sample": sample_idx, "mode": mode, **result}
                     records.append(record)
