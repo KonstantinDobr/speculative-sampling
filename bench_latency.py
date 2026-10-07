@@ -104,7 +104,7 @@ def measure_alpha(target_name: str, draft_name: str, dtype: torch.dtype, problem
 
     accepted = rejected = 0
     for problem in problems:
-        input_ids = tokenizer(get_prompt(problem), return_tensors="pt").input_ids.to(DEVICE)
+        input_ids = tokenizer(get_prompt(problem, tokenizer), return_tensors="pt").input_ids.to(DEVICE)
         _, stats = speculative_generate(target, draft, input_ids, args.alpha_max_new_tokens, args.alpha_K,
                                         args.temperature, args.top_p, tokenizer.eos_token_id, stop_fn)
         accepted += stats["accepted"]

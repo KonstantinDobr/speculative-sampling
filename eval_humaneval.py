@@ -64,10 +64,14 @@ def make_stop_fn(tokenizer):
     return stop_fn
 
 
-def get_prompt(problem: dict) -> str:
-    # Промпт кончается на "\n": такой одиночный токен модель почти не видела (обычно "\n" склеен
-    # с отступом) и сразу выдаёт EOS. Поэтому хвостовые пробелы срезаем, как в bigcode-evaluation-harness
-    return problem["prompt"].rstrip()
+def get_prompt(problem: dict, tokenizer) -> str:
+    # Промпт кончается на "\n". Если токенизатор выделяет его в отдельный токен (SmolLM2, OPT), модель такой
+    # одиночный токен почти не видела (обычно "\n" склеен с отступом) и сразу выдаёт EOS — тогда хвостовые
+    # пробелы срезаем, как в bigcode-evaluation-harness. Если "\n" склеен с кавычками (Qwen: ' """\n'), срезать
+    # нельзя: без него модель считает функцию законченной и начинает новую def — ответ получается пустым
+    prompt = problem["prompt"]
+    last_token = tokenizer.decode(tokenizer(prompt).input_ids[-1:])
+    return prompt.rstrip() if last_token.strip() == "" else prompt
 
 
 def run_tests(problem: dict, completion: str, timeout: float) -> bool:
@@ -174,7 +178,7 @@ def main():
     stop_fn = make_stop_fn(tokenizer)
 
     # Прогрев: первые вызовы на GPU медленные (инициализация CUDA, аллокатор), в замеры не идут
-    warmup_ids = tokenizer(get_prompt(problems[0]), return_tensors="pt").input_ids.to(DEVICE)
+    warmup_ids = tokenizer(get_prompt(problems[0], tokenizer), return_tensors="pt").input_ids.to(DEVICE)
     autoregressive_generate(target, warmup_ids, 8, args.temperature, args.top_p)
     speculative_generate(target, draft, warmup_ids, 8, args.K, args.temperature, args.top_p)
 
@@ -186,7 +190,7 @@ def main():
     records = []
     with open(records_path, "w", encoding="utf-8") as f:
         for i, problem in enumerate(problems):
-            input_ids = tokenizer(get_prompt(problem), return_tensors="pt").input_ids.to(DEVICE)
+            input_ids = tokenizer(get_prompt(problem, tokenizer), return_tensors="pt").input_ids.to(DEVICE)
 
             for sample_idx in range(args.n_samples):
                 for mode in MODES:

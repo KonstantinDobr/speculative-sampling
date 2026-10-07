@@ -232,3 +232,23 @@ def test_model_ignoring_logits_to_keep(models, temperature):
         output, _ = speculative_generate(wrapped_target, wrapped_draft, input_ids, 30, K, temperature,
                                          generator=make_generator(3, "cpu"))
         assert torch.equal(output, expected), f"K={K}"
+
+
+class FakeTokenizer:
+    # Токен — кусок текста: либо "\n" отдельно (как у SmolLM2 и OPT), либо склеенный с кавычками (как у Qwen)
+    def __init__(self, merge_newline: bool):
+        self.merge_newline = merge_newline
+
+    def __call__(self, text):
+        body = text[:-1]
+        pieces = [body[:-3], body[-3:] + "\n"] if self.merge_newline else [body, "\n"]
+        return type("Encoding", (), {"input_ids": pieces})()
+
+    def decode(self, ids):
+        return "".join(ids)
+
+
+@pytest.mark.parametrize("merge_newline, expected", [(False, '    """'), (True, '    """\n')])
+def test_get_prompt_strips_only_standalone_newline(merge_newline, expected):
+    from eval_humaneval import get_prompt
+    assert get_prompt({"prompt": '    """\n'}, FakeTokenizer(merge_newline)) == expected
