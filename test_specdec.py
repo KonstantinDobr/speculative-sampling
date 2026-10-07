@@ -209,3 +209,26 @@ def test_sps_never_exceeds_max_new_tokens(models, K):
     for max_new_tokens in (1, 2, 5, 13):
         output, _ = speculative_generate(target, drafts["same"], input_ids, max_new_tokens, K, 1.0)
         assert output.shape[1] == input_ids.shape[1] + max_new_tokens
+
+
+class IgnoresLogitsToKeep(torch.nn.Module):
+    # Как OPT в transformers 4.57: принимает logits_to_keep, но возвращает логиты по всем позициям
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, *args, logits_to_keep=None, **kwargs):
+        return self.model(*args, **kwargs)
+
+
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_model_ignoring_logits_to_keep(models, temperature):
+    target, drafts = models
+    input_ids = torch.tensor([PROMPTS[0]])
+    wrapped_target, wrapped_draft = IgnoresLogitsToKeep(target), IgnoresLogitsToKeep(drafts["close"])
+    for K in (0, 1, 4):
+        expected, _ = speculative_generate(target, drafts["close"], input_ids, 30, K, temperature,
+                                           generator=make_generator(3, "cpu"))
+        output, _ = speculative_generate(wrapped_target, wrapped_draft, input_ids, 30, K, temperature,
+                                         generator=make_generator(3, "cpu"))
+        assert torch.equal(output, expected), f"K={K}"

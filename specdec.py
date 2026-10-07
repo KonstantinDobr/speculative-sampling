@@ -4,16 +4,18 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
-# Пары (таргет, драфт), только base-модели. Какую брать — решаем по замеру скоростей draft/target
+# Пары (таргет, драфт) из моделей в /data/shared/hf, только base-модели. При batch 1 время прохода
+# пропорционально числу слоёв, поэтому в комментариях — слои драфт / таргет
 MODEL_PAIRS = {
-    "smollm2-135m-1.7b": ("HuggingFaceTB/SmolLM2-1.7B", "HuggingFaceTB/SmolLM2-135M"),
-    "smollm2-360m-1.7b": ("HuggingFaceTB/SmolLM2-1.7B", "HuggingFaceTB/SmolLM2-360M"),
-    "qwen2.5-0.5b-1.5b": ("Qwen/Qwen2.5-1.5B", "Qwen/Qwen2.5-0.5B"),
-    "qwen2.5-0.5b-3b": ("Qwen/Qwen2.5-3B", "Qwen/Qwen2.5-0.5B"),
-    "qwen2.5-0.5b-7b": ("Qwen/Qwen2.5-7B", "Qwen/Qwen2.5-0.5B"),
-    "qwen2.5-coder-0.5b-7b": ("Qwen/Qwen2.5-Coder-7B", "Qwen/Qwen2.5-Coder-0.5B"),
+    "qwen2.5-0.5b-14b": ("Qwen/Qwen2.5-14B", "Qwen/Qwen2.5-0.5B"),      # 24 / 48
+    "qwen2.5-0.5b-7b": ("Qwen/Qwen2.5-7B", "Qwen/Qwen2.5-0.5B"),        # 24 / 28
+    "qwen2.5-0.5b-3b": ("Qwen/Qwen2.5-3B", "Qwen/Qwen2.5-0.5B"),        # 24 / 36
+    "opt-125m-13b": ("facebook/opt-13b", "facebook/opt-125m"),          # 12 / 40
+    "opt-125m-6.7b": ("facebook/opt-6.7b", "facebook/opt-125m"),        # 12 / 32
+    "opt-125m-2.7b": ("facebook/opt-2.7b", "facebook/opt-125m"),        # 12 / 32
+    "smollm2-135m-1.7b": ("HuggingFaceTB/SmolLM2-1.7B", "HuggingFaceTB/SmolLM2-135M"),  # 30 / 24
 }
-DEFAULT_PAIR = "smollm2-135m-1.7b"
+DEFAULT_PAIR = "qwen2.5-0.5b-14b"
 TARGET_NAME, DRAFT_NAME = MODEL_PAIRS[DEFAULT_PAIR]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -113,7 +115,9 @@ def get_logits(model, input_ids: torch.Tensor, cache: DynamicCache | None = None
     if cache is not None:
         input_ids = input_ids[:, cache.get_seq_length():]
     kwargs = {} if n_last is None else {"logits_to_keep": n_last}
-    return model(input_ids, past_key_values=cache, use_cache=cache is not None, **kwargs).logits[0]
+    logits = model(input_ids, past_key_values=cache, use_cache=cache is not None, **kwargs).logits[0]
+    # Часть моделей (например, OPT) молча игнорирует logits_to_keep и возвращает все позиции
+    return logits if n_last is None else logits[-n_last:]
 
 
 def get_probs(model, input_ids: torch.Tensor, temperature: float, top_p: float = 1.0,
