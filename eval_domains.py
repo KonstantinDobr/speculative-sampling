@@ -20,7 +20,7 @@ import torch
 
 from metrics import position_metrics
 from specdec import (DEFAULT_PAIR, DEVICE, MODEL_PAIRS, autoregressive_generate, load_models, make_generator,
-                     speculative_generate, sync)
+                     speculative_generate, sync, with_cuda_graphs)
 
 TF_METRICS = ["ce_domain_p", "ce_domain_q", "acc_p", "acc_q", "alpha", "top1", "kl_pq"]
 MODES = ["target", "draft", "sps"]
@@ -45,6 +45,9 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
+    parser.add_argument("--cuda-graphs", action="store_true",
+                        help="статический кэш + CUDA graphs для коротких проходов (Llama/Qwen, не OPT)")
+    parser.add_argument("--max-cache-len", type=int, default=2048, help="длина статического кэша для --cuda-graphs")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-dir", default="results")
     return parser.parse_args()
@@ -231,6 +234,7 @@ def main():
     args.target, args.draft = args.target or pair_target, args.draft or pair_draft
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
     tokenizer, target, draft = load_models(args.target, args.draft, dtype)
+    tf_target, tf_draft = target, draft
 
     tf_rows = per_domain(rows, args.tf_per_domain) if args.tf_per_domain != 0 else []
     gen_rows = per_domain(rows, args.gen_per_domain) if args.gen_per_domain != 0 else []
@@ -238,7 +242,8 @@ def main():
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    run_name = f"domains_{args.pair}_K{args.K}_T{args.temperature}_{time.strftime('%Y%m%d-%H%M%S')}"
+    graphs = "_graphs" if args.cuda_graphs else ""
+    run_name = f"domains_{args.pair}_K{args.K}_T{args.temperature}{graphs}_{time.strftime('%Y%m%d-%H%M%S')}"
     records = []
 
     with open(out_dir / f"{run_name}.jsonl", "w", encoding="utf-8") as f:
@@ -248,11 +253,15 @@ def main():
             f.flush()
 
         for i, row in enumerate(tf_rows):
-            result = teacher_forced(target, draft, tokenizer, row, args)
+            result = teacher_forced(tf_target, tf_draft, tokenizer, row, args)
             if result is not None:
                 save({"id": row["id"], "domain": row["domain"], "kind": "tf", **result})
             if (i + 1) % 100 == 0:
                 print(f"teacher forcing: {i + 1}/{len(tf_rows)}", flush=True)
+
+        if gen_rows and args.cuda_graphs:
+            target = with_cuda_graphs(target, args.max_cache_len, args.K + 1)
+            draft = with_cuda_graphs(draft, args.max_cache_len, args.K + 1)
 
         if gen_rows:
             # Прогрев: первые вызовы на GPU медленные, в замеры не идут

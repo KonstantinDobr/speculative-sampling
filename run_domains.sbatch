@@ -8,6 +8,7 @@
 #SBATCH -o logs/domains_%j.log
 
 # Запуск: mkdir -p logs && sbatch run_domains.sbatch [доп. аргументы eval_domains.py]
+# С CUDA graphs (только Llama/Qwen): sbatch run_domains.sbatch --cuda-graphs; без флага — как раньше, без них
 # Другая пара: PAIR=opt-125m-13b sbatch run_domains.sbatch
 # Быстрая проверка: sbatch -t 0:20:00 run_domains.sbatch --tf-per-domain 5 --gen-per-domain 2
 # Снять задачу: scancel <job_id>

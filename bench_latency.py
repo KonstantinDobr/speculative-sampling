@@ -11,7 +11,7 @@ from transformers import AutoTokenizer
 
 from eval_humaneval import get_prompt, load_humaneval, make_stop_fn
 from specdec import (DEVICE, MODEL_PAIRS, describe, load_model, load_models, resolve_model, rollback,
-                     speculative_generate, sync)
+                     speculative_generate, sync, with_cuda_graphs)
 
 ALPHAS = [0.5, 0.6, 0.7, 0.8, 0.9]
 
@@ -24,6 +24,8 @@ def parse_args():
     parser.add_argument("--repeats", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
+    parser.add_argument("--cuda-graphs", action="store_true",
+                        help="мерить проходы со статическим кэшем и CUDA graphs (Llama/Qwen, не OPT)")
     parser.add_argument("--seed", type=int, default=0)
     # Короткий прогон SpS на HumanEval, чтобы подставить в формулу реальную α, а не только сетку
     parser.add_argument("--alpha-tasks", type=int, default=0, help="задач для оценки α (0 — не оценивать)")
@@ -69,18 +71,28 @@ def measure_model(name: str, dtype: torch.dtype, args) -> dict:
     result = {"description": describe(model), "num_layers": model.config.num_hidden_layers,
               "hidden_size": model.config.hidden_size, "decode": {}, "no_cache": {}}
     generator = torch.Generator().manual_seed(args.seed)
+    graph = (with_cuda_graphs(model, max(args.prefix_lens) + args.max_K + 2, args.max_K + 1)
+             if args.cuda_graphs else None)
 
     for L in args.prefix_lens:
         # Содержимое токенов на скорость не влияет, поэтому префикс случайный
         ids = torch.randint(n_vocab, (1, L + args.max_K + 1), generator=generator).to(DEVICE)
-        cache = model(ids[:, :L], use_cache=True).past_key_values
 
         # Проход по n новым токенам поверх кэша префикса длины L: n=1 — шаг ArS/драфта,
         # n=K+1 — проверка черновика таргетом. После каждого замера кэш откатываем обратно до L
         decode = {}
-        for n in range(1, args.max_K + 2):
-            decode[n] = time_call(lambda n=n: model(ids[:, L:L + n], past_key_values=cache, use_cache=True),
-                                  args.repeats, args.warmup, reset=lambda: rollback(cache, L))
+        if graph is not None:
+            graph.start()
+            graph.logits(ids[:, :L], n_last=1)  # prefill обычным forward
+            for n in range(1, args.max_K + 2):
+                decode[n] = time_call(lambda n=n: graph.logits(ids[:, :L + n], n_last=n),
+                                      args.repeats, args.warmup, reset=lambda: graph.rollback(L))
+        else:
+            cache = model(ids[:, :L], use_cache=True).past_key_values
+            for n in range(1, args.max_K + 2):
+                decode[n] = time_call(lambda n=n: model(ids[:, L:L + n], past_key_values=cache, use_cache=True),
+                                      args.repeats, args.warmup, reset=lambda: rollback(cache, L))
+            del cache
 
         # Для справки: один токен без KV-кэша, как сейчас работает specdec.py
         no_cache = time_call(lambda: model(ids[:, :L + 1]), args.repeats, args.warmup)
@@ -90,10 +102,11 @@ def measure_model(name: str, dtype: torch.dtype, args) -> dict:
         print(f"  L={L}: 1 токен {decode[1]['median_ms']:.2f} ms, {args.max_K + 1} токенов "
               f"{decode[args.max_K + 1]['median_ms']:.2f} ms, без кэша {no_cache['median_ms']:.2f} ms", flush=True)
 
-        del cache
         free_memory()
 
-    del model
+    del model, graph
+    if args.cuda_graphs:
+        torch._dynamo.reset()  # иначе скомпилированные графы держат веса прошлой модели в памяти GPU
     free_memory()
     return result
 
@@ -200,7 +213,7 @@ def main():
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"bench_{time.strftime('%Y%m%d-%H%M%S')}.json"
+    out_path = out_dir / f"bench{'_graphs' if args.cuda_graphs else ''}_{time.strftime('%Y%m%d-%H%M%S')}.json"
     env = {"device": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
            "torch": torch.__version__, "transformers": transformers.__version__}
     with open(out_path, "w", encoding="utf-8") as f:

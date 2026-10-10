@@ -8,7 +8,7 @@ import pytest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from specdec import (autoregressive_generate, get_probs, make_generator, residual_distribution, sample,
+from specdec import (GraphModel, autoregressive_generate, get_probs, make_generator, residual_distribution, sample,
                      speculative_generate, verify)
 
 torch.set_num_threads(1)
@@ -252,3 +252,59 @@ class FakeTokenizer:
 def test_get_prompt_strips_only_standalone_newline(merge_newline, expected):
     from eval_humaneval import get_prompt
     assert get_prompt({"prompt": '    """\n'}, FakeTokenizer(merge_newline)) == expected
+
+
+# ---------- статический кэш и CUDA graphs ----------
+# На CPU графов нет, поэтому компилируем с backend="eager": проверяются статический кэш, откаты и позиции,
+# а fullgraph=True — что forward трассируется целиком, без разрывов графа
+
+@pytest.fixture(scope="module")
+def graph_models(models):
+    target, drafts = models
+    wrap = lambda m: GraphModel(m, max_cache_len=128, compile_kwargs={"backend": "eager", "fullgraph": True})
+    graph_target = wrap(target)
+    graph_target.warmup()
+    return graph_target, {name: wrap(drafts[name]) for name in ("random", "close")}
+
+
+@pytest.mark.parametrize("prompt", PROMPTS)
+def test_graph_ars_matches_eager(models, graph_models, prompt):
+    target, _ = models
+    graph_target, _ = graph_models
+    input_ids = torch.tensor([prompt])
+    expected = autoregressive_generate(target, input_ids, 40, 0.0)
+    assert torch.equal(autoregressive_generate(graph_target, input_ids, 40, 0.0), expected)
+
+
+@pytest.mark.parametrize("draft_name", ["random", "close"])
+@pytest.mark.parametrize("prompt", PROMPTS)
+def test_graph_greedy_matches_ars(models, graph_models, draft_name, prompt):
+    # Одни и те же GraphModel переиспользуются во всех генерациях: проверяется и сброс между ними
+    target, _ = models
+    graph_target, graph_drafts = graph_models
+    input_ids = torch.tensor([prompt])
+    expected = autoregressive_generate(target, input_ids, 40, 0.0)
+    for K in range(8):
+        output, _ = speculative_generate(graph_target, graph_drafts[draft_name], input_ids, 40, K, 0.0)
+        assert torch.equal(output, expected), f"K={K}"
+
+
+def test_graph_mixed_with_eager_draft(models, graph_models):
+    target, drafts = models
+    graph_target, _ = graph_models
+    input_ids = torch.tensor([PROMPTS[0]])
+    expected = autoregressive_generate(target, input_ids, 40, 0.0)
+    output, _ = speculative_generate(graph_target, drafts["close"], input_ids, 40, 4, 0.0)
+    assert torch.equal(output, expected)
+
+
+def test_graph_same_model_for_target_and_draft_rejected(graph_models):
+    graph_target, _ = graph_models
+    with pytest.raises(AssertionError):
+        speculative_generate(graph_target, graph_target, torch.tensor([PROMPTS[0]]), 10, 2, 0.0)
+
+
+def test_graph_cache_overflow(graph_models):
+    graph_target, _ = graph_models
+    with pytest.raises(ValueError):
+        autoregressive_generate(graph_target, torch.tensor([PROMPTS[0]]), 200, 0.0)

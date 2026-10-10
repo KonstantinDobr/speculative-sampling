@@ -11,7 +11,7 @@ from pathlib import Path
 import torch
 
 from specdec import (DEFAULT_PAIR, DEVICE, MODEL_PAIRS, autoregressive_generate, load_models,
-                     make_generator, speculative_generate, sync)
+                     make_generator, speculative_generate, sync, with_cuda_graphs)
 
 # Стандартные стоп-последовательности HumanEval (как в Codex): функция закончилась
 STOP_SEQUENCES = ["\nclass", "\ndef", "\n#", "\nif", "\nprint"]
@@ -33,6 +33,9 @@ def parse_args():
     parser.add_argument("--max-new-tokens", type=int, default=512)
     # float32 — для проверок корректности (greedy-совпадение ArS/SpS), большие таргеты в нём не влезут
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
+    parser.add_argument("--cuda-graphs", action="store_true",
+                        help="статический кэш + CUDA graphs для коротких проходов (Llama/Qwen, не OPT)")
+    parser.add_argument("--max-cache-len", type=int, default=2048, help="длина статического кэша для --cuda-graphs")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=10.0, help="секунд на прогон тестов")
     parser.add_argument("--out-dir", default="results")
@@ -175,6 +178,9 @@ def main():
     pair_target, pair_draft = MODEL_PAIRS[args.pair]
     args.target, args.draft = args.target or pair_target, args.draft or pair_draft
     tokenizer, target, draft = load_models(args.target, args.draft, dtype)
+    if args.cuda_graphs:
+        target = with_cuda_graphs(target, args.max_cache_len, args.K + 1)
+        draft = with_cuda_graphs(draft, args.max_cache_len, args.K + 1)
     stop_fn = make_stop_fn(tokenizer)
 
     # Прогрев: первые вызовы на GPU медленные (инициализация CUDA, аллокатор), в замеры не идут
@@ -184,7 +190,8 @@ def main():
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    run_name = f"humaneval_{args.pair}_K{args.K}_T{args.temperature}_{time.strftime('%Y%m%d-%H%M%S')}"
+    graphs = "_graphs" if args.cuda_graphs else ""
+    run_name = f"humaneval_{args.pair}_K{args.K}_T{args.temperature}{graphs}_{time.strftime('%Y%m%d-%H%M%S')}"
     records_path = out_dir / f"{run_name}.jsonl"
 
     records = []

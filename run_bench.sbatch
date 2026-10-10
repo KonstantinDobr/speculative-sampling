@@ -8,6 +8,7 @@
 #SBATCH -o logs/bench_%j.log
 
 # Запуск: mkdir -p logs && sbatch run_bench.sbatch [доп. аргументы bench_latency.py]
+# С CUDA graphs (только Llama/Qwen): sbatch run_bench.sbatch --cuda-graphs; без флага — как раньше, без них
 # Только часть пар: sbatch run_bench.sbatch --pairs qwen2.5-0.5b-14b opt-125m-13b
 # Пары сравниваем только на одном типе GPU: при необходимости sbatch --gres=gpu:<тип>:1 run_bench.sbatch
 # Пары, для которых модели не скачаны (download_models.sh), пропускаются с предупреждением

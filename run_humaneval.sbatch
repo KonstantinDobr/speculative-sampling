@@ -8,6 +8,7 @@
 #SBATCH -o logs/humaneval_%j.log
 
 # Запуск: mkdir -p logs && sbatch run_humaneval.sbatch [доп. аргументы eval_humaneval.py]
+# С CUDA graphs (только Llama/Qwen): sbatch run_humaneval.sbatch --cuda-graphs; без флага — как раньше, без них
 # Другая пара моделей (список — MODEL_PAIRS в specdec.py): PAIR=opt-125m-13b sbatch run_humaneval.sbatch
 # Пример отладки: sbatch -t 0:20:00 run_humaneval.sbatch --limit 5 --temperature 0 --dtype float32
 # Снять задачу: scancel <job_id>
