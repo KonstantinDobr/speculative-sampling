@@ -15,8 +15,12 @@ HumanEval (prompt + canonical_solution) всегда идёт как reference: 
 Датасет — jsonl либо с полем text, как further_training.jsonl (первые --prompt-tokens токенов — промпт,
 дальше продолжение), либо с полями prompt и reference, как eval_set.jsonl. Результат:
 <out-dir>/train_<source>.pt и <out-dir>/humaneval.pt.
+
+Каждые --save-every батчей сделанное пишется в <файл кэша>.part: если задачу сняли (лимит времени), тот же
+запуск продолжит с этого места. С --limit кэш уходит в отдельную папку cache/<pair>_limit<N>.
 """
 import argparse
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,7 +35,10 @@ from specdec import (DEFAULT_PAIR, DEVICE, MODEL_PAIRS, describe, load_model, ma
                      sample, to_probs)
 
 SOURCES = ["generated", "reference"]
-PARTS = ["train", "humaneval"]
+# HumanEval — первым: он считается за минуты и не должен пропасть, если train не уложится в лимит времени
+PARTS = ["humaneval", "train"]
+# Параметры, от которых зависит содержимое кэша: недописанный кэш продолжается только при тех же
+KEY_ARGS = ["max_new_tokens", "top_k", "temperature", "top_p", "batch_size", "dtype", "seed"]
 
 
 def parse_args():
@@ -56,7 +63,9 @@ def parse_args():
                         help="сколько позиций за раз проходит через lm_head (векторы по размеру словаря — память)")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--out-dir", default=None, help="по умолчанию cache/<pair>")
+    parser.add_argument("--save-every", type=int, default=25, help="батчей между сохранениями недописанного кэша")
+    parser.add_argument("--out-dir", default=None,
+                        help="по умолчанию cache/<pair>, а с --limit — cache/<pair>_limit<N>")
     return parser.parse_args()
 
 
@@ -137,15 +146,33 @@ def teacher_topk(target, sequences: list[torch.Tensor], n_prompt, args) -> tuple
     return tuple(torch.cat(tensors) for tensors in zip(*parts))
 
 
+def save(data: dict, path: Path):
+    # Сначала во временный файл: если задачу снимут посреди записи, прежний файл останется целым
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(data, tmp)
+    os.replace(tmp, path)
+
+
 def build(target, examples: list[tuple[list[int], int]], source: str, args, eos_token_id: int,
-          generator: torch.Generator | None = None) -> dict:
-    """Кэш для примеров вида (токены, число токенов промпта)."""
+          generator: torch.Generator | None = None, partial: Path | None = None, key: dict | None = None) -> dict:
+    """Кэш для примеров вида (токены, число токенов промпта). partial — файл для недописанного кэша,
+    key — параметры запуска: продолжаем только кэш, начатый с теми же."""
     # Самые длинные — первыми: в батче примеры близкой длины, а нехватка памяти выясняется сразу
     examples = sorted(examples, key=lambda example: len(example[0]), reverse=True)
     sequences, n_prompts, topk = [], [], []
+    if partial is not None and partial.exists():
+        state = torch.load(partial, weights_only=True)
+        if state["key"] == key:
+            sequences, n_prompts, topk = state["sequences"], state["n_prompts"], state["topk"]
+            print(f"Продолжаю {partial}: готово {len(sequences)} примеров из {len(examples)}", flush=True)
+            # Другое зерно, чтобы не повторять сэмплы, которые уже выпали в начале прошлого запуска
+            if generator is not None:
+                generator.manual_seed(args.seed + len(sequences))
+        else:
+            print(f"{partial} начат с другими параметрами — строю кэш заново", flush=True)
     start_time = time.perf_counter()
 
-    for start in range(0, len(examples), args.batch_size):
+    for batch, start in enumerate(range(len(sequences), len(examples), args.batch_size), 1):
         ids, n_prompt = zip(*examples[start:start + args.batch_size])
         if source == "generated":
             new = generate(target, ids, args.max_new_tokens, args.temperature, args.top_p, eos_token_id, generator)
@@ -156,6 +183,8 @@ def build(target, examples: list[tuple[list[int], int]], source: str, args, eos_
         sequences += ids
         n_prompts += n_prompt
         print(f"[{len(sequences)}/{len(examples)}] {time.perf_counter() - start_time:.0f} с", flush=True)
+        if partial is not None and batch % args.save_every == 0:
+            save({"key": key, "sequences": sequences, "n_prompts": n_prompts, "topk": topk}, partial)
 
     indices, logp, probs = (torch.cat(tensors) for tensors in zip(*topk))
     return {"tokens": torch.cat(sequences).int(), "lengths": torch.tensor([len(s) for s in sequences]),
@@ -232,7 +261,9 @@ def read_rows(part: str, args) -> list[dict]:
 def main():
     args = parse_args()
     args.target = args.target or MODEL_PAIRS[args.pair][0]
-    out_dir = Path(args.out_dir or f"cache/{args.pair}")
+    # Пробный запуск с --limit не должен попасть в папку полного кэша: finetune.py молча взял бы обрезанный
+    limit = "" if args.limit is None else f"_limit{args.limit}"
+    out_dir = Path(args.out_dir or f"cache/{args.pair}{limit}")
     out_dir.mkdir(parents=True, exist_ok=True)
     # Датасеты читаем до загрузки таргета: опечатка в пути не должна стоить минут ожидания
     parts = {part: read_rows(part, args) for part in args.parts}
@@ -253,11 +284,15 @@ def main():
             raise SystemExit(f"{part}: нет ни одного подходящего примера")
         print(f"\n=== {part}: {len(examples)} примеров из {len(rows)}, продолжение — {source} ===")
 
-        cache = build(target, examples, source, args, tokenizer.eos_token_id, make_generator(args.seed))
+        path = out_dir / (f"train_{source}.pt" if part == "train" else "humaneval.pt")
+        partial = path.with_suffix(".part")
+        key = {"target": args.target, "source": source, "examples": len(examples),
+               "tokens": sum(len(ids) for ids, _ in examples), **{name: getattr(args, name) for name in KEY_ARGS}}
+        cache = build(target, examples, source, args, tokenizer.eos_token_id, make_generator(args.seed), partial, key)
         cache["meta"] = {"target": args.target, "part": part, "source": source, "n_vocab": len(tokenizer),
                          "temperature": args.temperature, "top_p": args.top_p}
-        path = out_dir / (f"train_{source}.pt" if part == "train" else "humaneval.pt")
-        torch.save(cache, path)
+        save(cache, path)
+        partial.unlink(missing_ok=True)
 
         rest_p = 1 - cache["logp"].float().exp().sum(dim=-1).mean().item()
         rest_sampler = 1 - cache["probs"].float().sum(dim=-1).mean().item()
