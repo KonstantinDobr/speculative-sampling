@@ -3,3 +3,5 @@
 __pycache__/
 logs/
 results_local/
+cache/
+checkpoints/

@@ -55,9 +55,8 @@ def describe(model) -> str:
             f"hidden {config.hidden_size}")
 
 
-def load_models(target_name: str = TARGET_NAME, draft_name: str = DRAFT_NAME,
-                dtype: torch.dtype = torch.float32, device: str = DEVICE):
-    target_name, draft_name = resolve_model(target_name), resolve_model(draft_name)
+def load_tokenizer(target_name: str, draft_name: str):
+    # Общий токенизатор пары: проверяем, что у таргета и драфта он один и тот же
     tokenizer = AutoTokenizer.from_pretrained(target_name)
     draft_tokenizer = AutoTokenizer.from_pretrained(draft_name)
 
@@ -67,6 +66,13 @@ def load_models(target_name: str = TARGET_NAME, draft_name: str = DRAFT_NAME,
            (draft_tokenizer.eos_token_id, draft_tokenizer.bos_token_id), (
         "Разные EOS/BOS: возможно, одна из моделей instruct-версия"
     )
+    return tokenizer
+
+
+def load_models(target_name: str = TARGET_NAME, draft_name: str = DRAFT_NAME,
+                dtype: torch.dtype = torch.float32, device: str = DEVICE):
+    target_name, draft_name = resolve_model(target_name), resolve_model(draft_name)
+    tokenizer = load_tokenizer(target_name, draft_name)
 
     n_vocab = len(tokenizer)
     target = load_model(target_name, dtype, n_vocab, device)
