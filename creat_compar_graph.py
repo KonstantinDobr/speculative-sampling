@@ -60,9 +60,12 @@ DOMAIN_TITLES = {
     "code_py_samerepo": "Те же репозитории, новые файлы",
     "code_py_newrepo": "Чужие репозитории",
     "code_py_tasks": "Задачи (BigCodeBench)",
+    "code_c_samerepo": "Те же репозитории, новые файлы",
+    "code_c_newrepo": "Чужие репозитории",
 }
 DOMAIN_TICKS = {"code_py_samerepo": "Те же\nрепозитории", "code_py_newrepo": "Чужие\nрепозитории",
-                "code_py_tasks": "Задачи"}
+                "code_py_tasks": "Задачи", "code_c_samerepo": "Те же\nрепозитории",
+                "code_c_newrepo": "Чужие\nрепозитории"}
 SURFACE, INK, MUTED, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e6e5df"
 DASHED = (0, (5, 3))
 # Доля по первым нескольким примерам скачет и растягивает шкалу — кривая начинается отсюда
