@@ -124,6 +124,22 @@ def test_cache_batches_cover_every_example(models, tmp_path):
         assert sorted(seen) == sorted(ids for ids, _ in examples)
 
 
+def test_cache_subset_keeps_examples_with_their_targets(models):
+    target, _ = models
+    examples = random_examples(11, seed=3)
+    cache = make_cache(target, examples, "reference", make_args())
+    picked = [7, 2, 9]
+    subset = cache.subset(picked)
+
+    assert len(subset) == 3
+    # Пример j подвыборки — это пример picked[j] полного кэша вместе с его top-k таргета
+    for j, i in enumerate(picked):
+        part, full = subset.batch([j], "cpu"), cache.batch([i], "cpu")
+        assert torch.equal(part.input_ids, full.input_ids) and torch.equal(part.predict, full.predict)
+        assert torch.equal(part.labels, full.labels) and torch.equal(part.indices, full.indices)
+        assert torch.equal(part.logp, full.logp) and torch.equal(part.probs, full.probs)
+
+
 def test_evaluate_matches_metrics(models):
     target, draft = models
     examples = random_examples(9, seed=4)

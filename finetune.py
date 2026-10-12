@@ -38,6 +38,8 @@ def parse_args():
     parser.add_argument("--draft", default=None, help="переопределяет драфт из --pair")
     parser.add_argument("--train-cache", default=None, help="по умолчанию cache/<pair>/train_generated.pt")
     parser.add_argument("--eval-cache", default=None, help="по умолчанию cache/<pair>/humaneval.pt")
+    parser.add_argument("--train-limit", type=int, default=None,
+                        help="учиться на N случайных примерах кэша; шагов столько же, сколько на полном кэше")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=None, help="переопределяет --epochs")
     parser.add_argument("--batch-size", type=int, default=8)
@@ -180,6 +182,13 @@ def main():
     eval_cache = TeacherCache.load(args.eval_cache or f"cache/{args.pair}/humaneval.pt")
     args.target = train_cache.meta["target"]
     assert eval_cache.meta["target"] == args.target, "Кэши train и HumanEval построены разными таргетами"
+    if args.train_limit is not None:
+        # Шагов — как на полном кэше: от размера выборки зависит только разнообразие данных, а не объём обучения.
+        # Кэш отсортирован по длине, поэтому берём не начало, а случайные примеры; зерно одно, так что
+        # меньшая выборка вложена в большую
+        args.max_steps = args.max_steps or args.epochs * math.ceil(len(train_cache) / args.batch_size)
+        order = torch.randperm(len(train_cache), generator=torch.Generator().manual_seed(args.seed))
+        train_cache = train_cache.subset(order[:args.train_limit].tolist())
 
     draft_path = resolve_model(args.draft)
     tokenizer = load_tokenizer(resolve_model(args.target), draft_path)
@@ -191,7 +200,8 @@ def main():
           f"{len(eval_cache.indices)} позиций, α при T={eval_cache.meta['temperature']}, "
           f"top_p={eval_cache.meta['top_p']}")
 
-    out_dir = Path(args.out_dir or f"checkpoints/{args.pair}_{args.loss}")
+    limit = "" if args.train_limit is None else f"_n{args.train_limit}"
+    out_dir = Path(args.out_dir or f"checkpoints/{args.pair}_{args.loss}{limit}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     def save(name: str):
@@ -200,7 +210,10 @@ def main():
 
     history = train(draft, train_cache, eval_cache, args, save)
     with open(out_dir / "history.json", "w", encoding="utf-8") as f:
-        json.dump({"args": vars(args), "history": history}, f, indent=2, ensure_ascii=False)
+        # temperature и top-p — сэмплера из кэша: с ними таргет генерировал продолжения и с ними посчитана α
+        json.dump({"args": vars(args), "train_examples": len(train_cache),
+                   "temperature": eval_cache.meta["temperature"], "top_p": eval_cache.meta["top_p"],
+                   "history": history}, f, indent=2, ensure_ascii=False)
 
     first, best = history[0], max(history, key=lambda record: record["alpha"])
     print(f"\n=== {args.loss}: α на HumanEval {first['alpha']:.4f} → {best['alpha']:.4f} (шаг {best['step']}), "

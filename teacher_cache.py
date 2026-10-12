@@ -221,6 +221,14 @@ class TeacherCache:
     def __len__(self) -> int:
         return len(self.lengths)
 
+    def subset(self, examples: list[int]) -> "TeacherCache":
+        """Кэш только из этих примеров, в заданном порядке."""
+        tokens = torch.cat([torch.arange(self.token_start[i], self.token_start[i + 1]) for i in examples])
+        rows = torch.cat([torch.arange(self.row_start[i], self.row_start[i + 1]) for i in examples])
+        return TeacherCache({"meta": self.meta, "tokens": self.tokens[tokens], "lengths": self.lengths[examples],
+                             "n_prompt": self.n_prompt[examples], "indices": self.indices[rows],
+                             "logp": self.logp[rows], "probs": self.probs[rows]})
+
     def batch(self, examples: list[int], device: torch.device) -> Batch:
         sequences = [self.tokens[self.token_start[i]:self.token_start[i + 1]].long() for i in examples]
         # Строки top-k идут в том же порядке, что и позиции в маске predict: по примерам, внутри — по возрастанию
